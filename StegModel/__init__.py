@@ -2,7 +2,7 @@
 Steganography watermark models package
 """
 
-from .model import (
+from .steg_model import (
     StegEncoder, 
     StegDecoder, 
     StegModel,
