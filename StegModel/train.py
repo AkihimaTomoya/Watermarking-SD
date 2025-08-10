@@ -20,7 +20,7 @@ from typing import Optional, Dict, Any
 import random
 import os
 
-from .model import StegModel, calculate_psnr, calculate_watermark_similarity, generate_random_watermark
+from .steg_model import StegModel, calculate_psnr, calculate_watermark_similarity, generate_random_watermark
 
 try:
     import wandb
