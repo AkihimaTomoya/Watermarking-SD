@@ -386,3 +386,210 @@ class WatermarkTrainer:
             val_loss_clean = [v for v in val_loss if v is not None]
             axes[0, 0].plot(val_epochs, val_loss_clean, 'r-', label='Val')
         axes[0, 0].set_title('Total Loss')
+        axes[0, 0].set_xlabel('Epoch')
+        axes[0, 0].set_ylabel('Loss')
+        axes[0, 0].legend()
+        axes[0, 0].grid(True)
+        
+        # PSNR
+        axes[0, 1].plot(epochs, train_psnr, 'b-', label='Train')
+        if any(v is not None for v in val_psnr):
+            val_epochs = [e for e, v in zip(epochs, val_psnr) if v is not None]
+            val_psnr_clean = [v for v in val_psnr if v is not None]
+            axes[0, 1].plot(val_epochs, val_psnr_clean, 'r-', label='Val')
+        axes[0, 1].set_title('PSNR')
+        axes[0, 1].set_xlabel('Epoch')
+        axes[0, 1].set_ylabel('PSNR (dB)')
+        axes[0, 1].legend()
+        axes[0, 1].grid(True)
+        
+        # Similarity
+        axes[1, 0].plot(epochs, train_sim, 'b-', label='Train')
+        if any(v is not None for v in val_sim):
+            val_epochs = [e for e, v in zip(epochs, val_sim) if v is not None]
+            val_sim_clean = [v for v in val_sim if v is not None]
+            axes[1, 0].plot(val_epochs, val_sim_clean, 'r-', label='Val')
+        axes[1, 0].set_title('Watermark Similarity')
+        axes[1, 0].set_xlabel('Epoch')
+        axes[1, 0].set_ylabel('Cosine Similarity')
+        axes[1, 0].legend()
+        axes[1, 0].grid(True)
+        
+        # Learning rate
+        lrs = [h['lr'] for h in history]
+        axes[1, 1].plot(epochs, lrs, 'g-')
+        axes[1, 1].set_title('Learning Rate')
+        axes[1, 1].set_xlabel('Epoch')
+        axes[1, 1].set_ylabel('Learning Rate')
+        axes[1, 1].set_yscale('log')
+        axes[1, 1].grid(True)
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"Training curves saved to {save_path}")
+        
+        plt.show()
+
+
+def create_data_loaders(
+    train_dir: str,
+    val_dir: Optional[str] = None,
+    batch_size: int = 8,
+    resolution: int = 512,
+    fingerprint_size: int = 48,
+    num_workers: int = 4,
+    train_split: float = 0.9
+) -> tuple:
+    """
+    Create training and validation data loaders
+    """
+    # Training dataset
+    train_dataset = WatermarkDataset(
+        train_dir,
+        resolution=resolution,
+        fingerprint_size=fingerprint_size,
+        augment=True
+    )
+    
+    # Validation dataset
+    if val_dir:
+        val_dataset = WatermarkDataset(
+            val_dir,
+            resolution=resolution,
+            fingerprint_size=fingerprint_size,
+            augment=False
+        )
+    else:
+        # Split training dataset
+        train_size = int(train_split * len(train_dataset))
+        val_size = len(train_dataset) - train_size
+        train_dataset, val_dataset = torch.utils.data.random_split(
+            train_dataset, [train_size, val_size]
+        )
+        
+        # Create separate validation dataset without augmentation
+        val_dataset.dataset = WatermarkDataset(
+            train_dir,
+            resolution=resolution,
+            fingerprint_size=fingerprint_size,
+            augment=False
+        )
+    
+    # Create data loaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        drop_last=True,
+        pin_memory=torch.cuda.is_available()
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        drop_last=True,
+        pin_memory=torch.cuda.is_available()
+    )
+    
+    return train_loader, val_loader
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Train watermark encoder/decoder")
+    parser.add_argument("--data_dir", required=True, help="Directory containing training images")
+    parser.add_argument("--val_data_dir", help="Directory containing validation images")
+    parser.add_argument("--output_dir", default="./watermark_models", help="Output directory for trained models")
+    parser.add_argument("--resolution", type=int, default=512, help="Image resolution")
+    parser.add_argument("--fingerprint_size", type=int, default=48, help="Watermark fingerprint size")
+    parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
+    parser.add_argument("--num_epochs", type=int, default=100, help="Number of training epochs")
+    parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--lambda_image", type=float, default=1.0, help="Weight for image reconstruction loss")
+    parser.add_argument("--lambda_watermark", type=float, default=1.0, help="Weight for watermark extraction loss")
+    parser.add_argument("--save_interval", type=int, default=10, help="Save model every N epochs")
+    parser.add_argument("--eval_interval", type=int, default=5, help="Evaluate on validation set every N epochs")
+    parser.add_argument("--use_wandb", action='store_true', help="Use Weights & Biases for logging")
+    parser.add_argument("--wandb_project", default="watermark-training", help="W&B project name")
+    parser.add_argument("--num_workers", type=int, default=4, help="Number of data loader workers")
+    parser.add_argument("--train_split", type=float, default=0.9, help="Train/val split ratio (if no val_data_dir)")
+    parser.add_argument("--resume", help="Path to checkpoint to resume training from")
+    parser.add_argument("--plot_curves", action='store_true', help="Plot training curves at the end")
+    
+    args = parser.parse_args()
+    
+    # Set device
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"Using device: {device}")
+    
+    # Create data loaders
+    print("Creating data loaders...")
+    train_loader, val_loader = create_data_loaders(
+        train_dir=args.data_dir,
+        val_dir=args.val_data_dir,
+        batch_size=args.batch_size,
+        resolution=args.resolution,
+        fingerprint_size=args.fingerprint_size,
+        num_workers=args.num_workers,
+        train_split=args.train_split
+    )
+    
+    print(f"Training batches: {len(train_loader)}")
+    print(f"Validation batches: {len(val_loader)}")
+    
+    # Create model
+    model = StegModel(
+        resolution=args.resolution,
+        image_channels=3,
+        fingerprint_size=args.fingerprint_size
+    )
+    
+    print(f"Encoder parameters: {sum(p.numel() for p in model.encoder.parameters()):,}")
+    print(f"Decoder parameters: {sum(p.numel() for p in model.decoder.parameters()):,}")
+    print(f"Total parameters: {sum(p.numel() for p in model.parameters()):,}")
+    
+    # Resume from checkpoint if specified
+    start_epoch = 0
+    if args.resume:
+        print(f"Resuming training from {args.resume}")
+        checkpoint = torch.load(args.resume, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        start_epoch = checkpoint.get('epoch', 0)
+        print(f"Resumed from epoch {start_epoch}")
+    
+    # Create trainer
+    trainer = WatermarkTrainer(
+        model=model,
+        device=device,
+        learning_rate=args.learning_rate,
+        lambda_image=args.lambda_image,
+        lambda_watermark=args.lambda_watermark,
+        use_wandb=args.use_wandb,
+        project_name=args.wandb_project
+    )
+    
+    # Start training
+    print("Starting training...")
+    history = trainer.train(
+        train_loader=train_loader,
+        val_loader=val_loader,
+        num_epochs=args.num_epochs,
+        save_dir=args.output_dir,
+        save_interval=args.save_interval,
+        eval_interval=args.eval_interval
+    )
+    
+    # Plot training curves
+    if args.plot_curves:
+        save_path = Path(args.output_dir) / "training_curves.png"
+        trainer.plot_training_curves(history, save_path)
+    
+    print("Training completed successfully!")
+
+
+if __name__ == "__main__":
+    main()
