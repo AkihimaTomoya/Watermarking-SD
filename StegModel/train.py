@@ -9,6 +9,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as transforms
+import torchvision.utils as vutils
 import numpy as np
 from PIL import Image
 import argparse
@@ -16,7 +17,7 @@ import json
 from pathlib import Path
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import random
 import os
 
@@ -114,7 +115,7 @@ class WatermarkDataset(Dataset):
 
 class WatermarkTrainer:
     """
-    Trainer for watermark encoder/decoder
+    Enhanced trainer for watermark encoder/decoder with image sampling
     """
     def __init__(
         self,
@@ -124,12 +125,16 @@ class WatermarkTrainer:
         lambda_image: float = 1.0,
         lambda_watermark: float = 1.0,
         use_wandb: bool = False,
-        project_name: str = "watermark-training"
+        project_name: str = "watermark-training",
+        save_samples: bool = True,
+        num_samples: int = 8
     ):
         self.device = device
         self.model = model.to(device)
         self.lambda_image = lambda_image
         self.lambda_watermark = lambda_watermark
+        self.save_samples = save_samples
+        self.num_samples = num_samples
         
         # Optimizer
         self.optimizer = optim.Adam(model.parameters(), lr=learning_rate)
@@ -149,11 +154,134 @@ class WatermarkTrainer:
         else:
             self.use_lpips = False
         
+        # Fixed sample data for consistent visualization
+        self.fixed_samples = None
+        self.fixed_watermarks = None
+        
         # Wandb setup
         self.use_wandb = use_wandb and WANDB_AVAILABLE
         if self.use_wandb:
             wandb.init(project=project_name)
             wandb.watch(self.model)
+    
+    def setup_fixed_samples(self, data_loader: DataLoader):
+        """Setup fixed samples for consistent visualization across epochs"""
+        print("Setting up fixed samples for visualization...")
+        
+        # Get a batch of samples
+        sample_batch = next(iter(data_loader))
+        images, watermarks = sample_batch
+        
+        # Take only the specified number of samples
+        self.fixed_samples = images[:self.num_samples].to(self.device)
+        self.fixed_watermarks = watermarks[:self.num_samples].to(self.device)
+        
+        print(f"Fixed {self.num_samples} samples for visualization")
+    
+    def denormalize_image(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Denormalize image tensor from [-1,1] to [0,1]"""
+        return (tensor + 1) / 2
+    
+    def save_sample_images(self, epoch: int, save_dir: Path, prefix: str = ""):
+        """Save sample images showing original, watermarked, and difference"""
+        if not self.save_samples or self.fixed_samples is None:
+            return
+        
+        self.model.eval()
+        
+        with torch.no_grad():
+            # Generate watermarked images and extract watermarks
+            watermarked_images, extracted_watermarks = self.model(
+                self.fixed_samples, self.fixed_watermarks
+            )
+            
+            # Calculate difference (amplified for visualization)
+            difference = torch.abs(watermarked_images - self.fixed_samples) * 10
+            difference = torch.clamp(difference, 0, 1)
+            
+            # Denormalize images for saving
+            original_imgs = self.denormalize_image(self.fixed_samples)
+            watermarked_imgs = self.denormalize_image(watermarked_images)
+            
+            # Create comparison grid
+            comparison_images = []
+            for i in range(self.num_samples):
+                comparison_images.extend([
+                    original_imgs[i],
+                    watermarked_imgs[i], 
+                    difference[i]
+                ])
+            
+            # Save grid
+            grid = vutils.make_grid(
+                comparison_images, 
+                nrow=3,  # 3 images per row (original, watermarked, difference)
+                padding=2,
+                normalize=False,
+                pad_value=1.0
+            )
+            
+            # Create samples directory
+            samples_dir = save_dir / "samples"
+            samples_dir.mkdir(exist_ok=True)
+            
+            # Save image
+            filename = f"{prefix}epoch_{epoch:04d}_samples.png" if prefix else f"epoch_{epoch:04d}_samples.png"
+            vutils.save_image(grid, samples_dir / filename)
+            
+            # Calculate and save metrics for these samples
+            psnr = calculate_psnr(watermarked_images, self.fixed_samples)
+            cosine_sim = calculate_watermark_similarity(extracted_watermarks, self.fixed_watermarks)
+            
+            # Save detailed comparison for first sample
+            if epoch % 20 == 0 or prefix == "best_":  # Save detailed view less frequently
+                self.save_detailed_comparison(
+                    epoch, samples_dir, 
+                    original_imgs[0], watermarked_imgs[0], difference[0],
+                    psnr.item(), cosine_sim.item(), prefix
+                )
+            
+            # Log to wandb if available
+            if self.use_wandb:
+                wandb.log({
+                    f"samples/comparison_grid": wandb.Image(grid),
+                    f"samples/psnr": psnr.item(),
+                    f"samples/cosine_similarity": cosine_sim.item()
+                }, step=epoch)
+        
+        self.model.train()
+    
+    def save_detailed_comparison(self, epoch: int, save_dir: Path, 
+                                original: torch.Tensor, watermarked: torch.Tensor, 
+                                difference: torch.Tensor, psnr: float, 
+                                cosine_sim: float, prefix: str = ""):
+        """Save detailed comparison with metrics for a single image"""
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        
+        # Convert tensors to numpy for matplotlib
+        original_np = original.cpu().permute(1, 2, 0).numpy()
+        watermarked_np = watermarked.cpu().permute(1, 2, 0).numpy()
+        difference_np = difference.cpu().permute(1, 2, 0).numpy()
+        
+        # Plot images
+        axes[0].imshow(original_np)
+        axes[0].set_title('Original Image')
+        axes[0].axis('off')
+        
+        axes[1].imshow(watermarked_np)
+        axes[1].set_title(f'Watermarked Image\nPSNR: {psnr:.2f}dB')
+        axes[1].axis('off')
+        
+        axes[2].imshow(difference_np)
+        axes[2].set_title(f'Difference (×10)\nSimilarity: {cosine_sim:.3f}')
+        axes[2].axis('off')
+        
+        plt.tight_layout()
+        
+        # Save figure
+        filename = f"{prefix}epoch_{epoch:04d}_detailed.png" if prefix else f"epoch_{epoch:04d}_detailed.png"
+        plt.savefig(save_dir / filename, dpi=150, bbox_inches='tight')
+        plt.close()
     
     def calculate_lpips(self, img1: torch.Tensor, img2: torch.Tensor) -> torch.Tensor:
         """Calculate LPIPS between two images"""
@@ -262,12 +390,20 @@ class WatermarkTrainer:
         save_interval: int = 10,
         eval_interval: int = 5
     ):
-        """Full training loop"""
+        """Full training loop with automatic image sampling"""
         save_dir = Path(save_dir)
         save_dir.mkdir(exist_ok=True, parents=True)
         
+        # Set up fixed samples for visualization
+        if self.save_samples:
+            self.setup_fixed_samples(train_loader)
+        
         best_similarity = 0
         training_history = []
+        
+        # Save initial samples (epoch 0)
+        if self.save_samples:
+            self.save_sample_images(0, save_dir)
         
         for epoch in range(num_epochs):
             epoch_metrics = {
@@ -338,19 +474,28 @@ class WatermarkTrainer:
                 log_dict['learning_rate'] = self.optimizer.param_groups[0]['lr']
                 wandb.log(log_dict)
             
-            # Save model
+            # Save model and samples at save_interval
             should_save = False
             suffix = ""
             
+            # Regular interval saves (both model and samples)
             if (epoch + 1) % save_interval == 0:
                 should_save = True
                 suffix = f"_epoch_{epoch+1}"
+                # Save samples at same time as model
+                if self.save_samples:
+                    self.save_sample_images(epoch + 1, save_dir)
             
+            # Best model saves (both model and samples)
             if val_similarity > best_similarity:
                 best_similarity = val_similarity
                 should_save = True
                 suffix = "_best"
+                # Save best samples
+                if self.save_samples:
+                    self.save_sample_images(epoch + 1, save_dir, "best_")
             
+            # Save model
             if should_save:
                 self.model.save_models(save_dir, prefix=suffix)
                 
@@ -363,6 +508,10 @@ class WatermarkTrainer:
         # Save final training history
         with open(save_dir / "training_history_final.json", 'w') as f:
             json.dump(training_history, f, indent=2)
+        
+        # Save final samples
+        if self.save_samples:
+            self.save_sample_images(num_epochs, save_dir, "final_")
         
         return training_history
 
@@ -500,7 +649,7 @@ def create_data_loaders(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train watermark encoder/decoder")
+    parser = argparse.ArgumentParser(description="Train watermark encoder/decoder with image sampling")
     parser.add_argument("--data_dir", required=True, help="Directory containing training images")
     parser.add_argument("--val_data_dir", help="Directory containing validation images")
     parser.add_argument("--output_dir", default="./watermark_models", help="Output directory for trained models")
@@ -513,6 +662,7 @@ def main():
     parser.add_argument("--lambda_watermark", type=float, default=1.0, help="Weight for watermark extraction loss")
     parser.add_argument("--save_interval", type=int, default=10, help="Save model every N epochs")
     parser.add_argument("--eval_interval", type=int, default=5, help="Evaluate on validation set every N epochs")
+    parser.add_argument("--num_samples", type=int, default=8, help="Number of sample images to save")
     parser.add_argument("--use_wandb", action='store_true', help="Use Weights & Biases for logging")
     parser.add_argument("--wandb_project", default="watermark-training", help="W&B project name")
     parser.add_argument("--num_workers", type=int, default=4, help="Number of data loader workers")
@@ -569,7 +719,9 @@ def main():
         lambda_image=args.lambda_image,
         lambda_watermark=args.lambda_watermark,
         use_wandb=args.use_wandb,
-        project_name=args.wandb_project
+        project_name=args.wandb_project,
+        save_samples=True,  # Always save samples
+        num_samples=args.num_samples
     )
     
     # Start training
