@@ -172,11 +172,15 @@ class WatermarkTrainer:
         sample_batch = next(iter(data_loader))
         images, watermarks = sample_batch
         
-        # Take only the specified number of samples
-        self.fixed_samples = images[:self.num_samples].to(self.device)
-        self.fixed_watermarks = watermarks[:self.num_samples].to(self.device)
+        # Adjust num_samples based on actual batch size
+        actual_samples = min(self.num_samples, images.size(0))
+        self.num_samples = actual_samples  # Update for consistency
         
-        print(f"Fixed {self.num_samples} samples for visualization")
+        # Take only the available number of samples
+        self.fixed_samples = images[:actual_samples].to(self.device)
+        self.fixed_watermarks = watermarks[:actual_samples].to(self.device)
+        
+        print(f"Fixed {actual_samples} samples for visualization (adjusted from requested {self.num_samples})")
     
     def denormalize_image(self, tensor: torch.Tensor) -> torch.Tensor:
         """Denormalize image tensor from [-1,1] to [0,1]"""
@@ -185,6 +189,11 @@ class WatermarkTrainer:
     def save_sample_images(self, epoch: int, save_dir: Path, prefix: str = ""):
         """Save sample images showing original, watermarked, and difference"""
         if not self.save_samples or self.fixed_samples is None:
+            return
+        
+        # Additional safety check
+        if self.fixed_samples.size(0) == 0:
+            print("Warning: No fixed samples available for visualization")
             return
         
         self.model.eval()
@@ -203,9 +212,12 @@ class WatermarkTrainer:
             original_imgs = self.denormalize_image(self.fixed_samples)
             watermarked_imgs = self.denormalize_image(watermarked_images)
             
+            # Get actual number of samples to avoid index errors
+            actual_num_samples = min(self.num_samples, original_imgs.size(0))
+            
             # Create comparison grid
             comparison_images = []
-            for i in range(self.num_samples):
+            for i in range(actual_num_samples):
                 comparison_images.extend([
                     original_imgs[i],
                     watermarked_imgs[i], 
@@ -662,7 +674,7 @@ def main():
     parser.add_argument("--lambda_watermark", type=float, default=1.0, help="Weight for watermark extraction loss")
     parser.add_argument("--save_interval", type=int, default=10, help="Save model every N epochs")
     parser.add_argument("--eval_interval", type=int, default=5, help="Evaluate on validation set every N epochs")
-    parser.add_argument("--num_samples", type=int, default=8, help="Number of sample images to save")
+    parser.add_argument("--num_samples", type=int, default=4, help="Number of sample images to save (will be adjusted to min(num_samples, batch_size))")
     parser.add_argument("--use_wandb", action='store_true', help="Use Weights & Biases for logging")
     parser.add_argument("--wandb_project", default="watermark-training", help="W&B project name")
     parser.add_argument("--num_workers", type=int, default=4, help="Number of data loader workers")
